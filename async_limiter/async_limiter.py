@@ -74,17 +74,16 @@ class DualRateLimiter:
             max_requests if not conservative else max(1, max_requests - 1)
         )
 
-        # Semaphore to limit concurrent requests. Bounded, so that releasing
-        # more often than acquiring cannot raise the limit
-        self.semaphore = asyncio.BoundedSemaphore(max_concurrent)
+        # Semaphore to limit concurrent requests and lock to protect the
+        # request_times queue. Both are created on first use, inside the running
+        # event loop: on Python 3.9 they cannot be created without one
+        self._semaphore: Optional[asyncio.BoundedSemaphore] = None
+        self._lock: Optional[asyncio.Lock] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Queue to track request timestamps (time.monotonic(), so that changes
         # to the system clock cannot stall or loosen the limit)
         self.request_times: Deque[float] = deque()
-
-        # Lock to protect the request_times queue during concurrent access
-        self.lock = asyncio.Lock()
 
         # Metrics
         self._metrics = {
@@ -100,6 +99,29 @@ class DualRateLimiter:
             f"requests={self._effective_max_requests}/{time_period}s "
             f"(conservative from original {max_requests})"
         )
+
+    @property
+    def semaphore(self) -> asyncio.BoundedSemaphore:
+        """Semaphore limiting concurrent requests. Bounded, so that releasing
+        more often than acquiring cannot raise the limit."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
+        return self._semaphore
+
+    @semaphore.setter
+    def semaphore(self, value: asyncio.BoundedSemaphore) -> None:
+        self._semaphore = value
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Lock protecting the request_times queue."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    @lock.setter
+    def lock(self, value: asyncio.Lock) -> None:
+        self._lock = value
 
     def _bind_to_running_loop(self) -> None:
         """
@@ -231,6 +253,8 @@ class DualRateLimiter:
     def release(self):
         """Release the semaphore to allow another concurrent request."""
         try:
+            if self._semaphore is None:
+                raise ValueError("release() called before any acquire()")
             self.semaphore.release()
             self._metrics["current_requests"] = max(
                 0, self._metrics["current_requests"] - 1

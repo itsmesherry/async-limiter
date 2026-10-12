@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two `asyncio.run()` calls or a test suite with one loop per test, raised
   `RuntimeError` as soon as a caller had to wait. This also affected
   module-level limiters on Python 3.9.
+- On Python 3.9, creating a limiter after an earlier `asyncio.run()` had
+  finished raised `RuntimeError`.
 
 ### Added
 
