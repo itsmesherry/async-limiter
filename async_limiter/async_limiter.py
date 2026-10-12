@@ -5,7 +5,6 @@ import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional
 
-# Set up logging with appropriate level
 logger = logging.getLogger("rate_limiter")
 
 
@@ -75,36 +74,32 @@ class DualRateLimiter:
         self.name = name or "default"
         self.wait_margin = wait_margin
 
-        # Make the rate limit more conservative to avoid edge cases
-        # For example, if API allows 5 requests per minute, we'll allow 4
+        # Leave a margin of one request: if the API allows 5 per minute, allow 4
         self._effective_max_requests = (
-            max_requests if not conservative else max(1, max_requests - 1)
+            max(1, max_requests - 1) if conservative else max_requests
         )
 
-        # Semaphore to limit concurrent requests and lock to protect the
-        # request_times queue. Both are created on first use, inside the running
-        # event loop: on Python 3.9 they cannot be created without one
+        # Created on first use, inside the running event loop: on Python 3.9
+        # asyncio primitives cannot be created without one
         self._semaphore: Optional[asyncio.BoundedSemaphore] = None
         self._lock: Optional[asyncio.Lock] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Queue to track request timestamps (time.monotonic(), so that changes
-        # to the system clock cannot stall or loosen the limit)
+        # Start times of recent requests, from time.monotonic() so that changes
+        # to the system clock cannot stall or loosen the limit
         self.request_times: Deque[float] = deque()
 
-        # Metrics
-        self._metrics = {
+        self._metrics: Dict[str, Any] = {
             "total_requests": 0,
             "current_requests": 0,
             "rate_limit_delays": 0,
             "total_delay_time": 0.0,
-            "errors": 0,
+            "errors": 0,  # always 0; kept so that get_metrics() keeps its keys
         }
 
         logger.info(
             f"DualRateLimiter '{self.name}' initialized with: concurrent={max_concurrent}, "
-            f"requests={self._effective_max_requests}/{time_period}s "
-            f"(conservative from original {max_requests})"
+            f"requests={self._effective_max_requests}/{time_period}s"
         )
 
     @property
@@ -121,7 +116,8 @@ class DualRateLimiter:
 
     @property
     def lock(self) -> asyncio.Lock:
-        """Lock protecting the request_times queue."""
+        """Unused: nothing in the limiter awaits while it updates its state.
+        Kept because it has been a public attribute since 1.0."""
         if self._lock is None:
             self._lock = asyncio.Lock()
         return self._lock
@@ -132,141 +128,88 @@ class DualRateLimiter:
 
     def _bind_to_running_loop(self) -> None:
         """
-        Start with a fresh semaphore and lock when the event loop has changed.
+        Start with a fresh semaphore when the event loop has changed.
 
         asyncio primitives belong to the loop they first waited in, so a limiter
         created at module level and used from a second asyncio.run() would fail.
         The request history is kept: the time-based limit spans event loops.
+
+        Raises:
+            RuntimeError: If the previous loop is still running, which means two
+                threads are using the limiter at the same time
         """
         loop = asyncio.get_running_loop()
         if loop is not self._loop:
+            if self._loop is not None and self._loop.is_running():
+                raise RuntimeError(
+                    f"DualRateLimiter '{self.name}' is in use by another running "
+                    "event loop; it cannot be shared between event loops that "
+                    "run at the same time"
+                )
             self._loop = loop
-            self.semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
-            self.lock = asyncio.Lock()
+            self._semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
+            self._lock = None
             self._metrics["current_requests"] = 0
 
-    async def _clean_old_requests(self):
+    def _clean_old_requests(self, now: float) -> None:
         """Remove request timestamps that are outside the time period."""
-        current_time = time.monotonic()
-        cutoff_time = current_time - self.time_period
-
-        old_count = len(self.request_times)
+        cutoff_time = now - self.time_period
         while self.request_times and self.request_times[0] <= cutoff_time:
             self.request_times.popleft()
-        new_count = len(self.request_times)
 
-        if old_count != new_count and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"[{self.name}] Cleaned {old_count - new_count} old requests, {new_count} remaining"
-            )
-
-    async def acquire(self):
+    async def acquire(self) -> None:
         """
         Acquire permission to make a request.
         This blocks until both rate limits allow the request.
-
-        Raises:
-            asyncio.CancelledError: If the task is cancelled while waiting
-            RuntimeError: If other unexpected errors occur during acquisition
         """
         self._bind_to_running_loop()
 
-        # First, acquire the semaphore to ensure we don't exceed concurrent limits
-        try:
-            await self.semaphore.acquire()
-            self._metrics["current_requests"] += 1
-        except asyncio.CancelledError:
-            logger.warning(
-                f"[{self.name}] Request cancelled while waiting for semaphore"
-            )
-            raise
-        except Exception as e:
-            self._metrics["errors"] += 1
-            logger.error(f"[{self.name}] Error acquiring semaphore: {str(e)}")
-            raise RuntimeError(
-                f"Failed to acquire rate limit semaphore: {str(e)}"
-            ) from e
+        # Concurrent limit first: a caller waiting on the time limit holds a slot
+        await self.semaphore.acquire()
+        self._metrics["current_requests"] += 1
 
         try:
-            # Then, check and wait for the time-based rate limit
             delay_start = None
             while True:
-                async with self.lock:
-                    await self._clean_old_requests()
-                    current_count = len(self.request_times)
+                now = time.monotonic()
+                self._clean_old_requests(now)
+                current_count = len(self.request_times)
 
-                    # If we have room for another request within the time period
-                    if current_count < self._effective_max_requests:
-                        # Record this request's timestamp
-                        self.request_times.append(time.monotonic())
-                        self._metrics["total_requests"] += 1
-
-                        # Record delay metrics if there was a delay
-                        if delay_start is not None:
-                            delay_time = time.monotonic() - delay_start
-                            self._metrics["total_delay_time"] += delay_time
-                            logger.debug(
-                                f"[{self.name}] Request allowed after waiting {delay_time:.2f}s"
-                            )
-
-                        return
-                    else:
-                        # Calculate wait time until the oldest request expires
-                        oldest_time = self.request_times[0]
-                        wait_time = oldest_time + self.time_period - time.monotonic()
-
-                        # Record that we hit the rate limit
-                        if delay_start is None:
-                            delay_start = time.monotonic()
-                            self._metrics["rate_limit_delays"] += 1
-
-                        logger.info(
-                            f"[{self.name}] Rate limit reached ({current_count}/{self._effective_max_requests}), "
-                            f"waiting {wait_time:.2f}s for a slot to open"
+                if current_count < self._effective_max_requests:
+                    self.request_times.append(now)
+                    self._metrics["total_requests"] += 1
+                    if delay_start is not None:
+                        delay_time = now - delay_start
+                        self._metrics["total_delay_time"] += delay_time
+                        logger.debug(
+                            f"[{self.name}] Request allowed after waiting {delay_time:.2f}s"
                         )
+                    return
 
-                # Wait until the oldest request expires
-                async with self.lock:
-                    if self.request_times:
-                        oldest_request = self.request_times[0]
-                        # Add a small buffer (wait_margin) to be safe
-                        wait_time = max(
-                            self.wait_margin,
-                            oldest_request
-                            + self.time_period
-                            - time.monotonic()
-                            + self.wait_margin,
-                        )
-                    else:
-                        wait_time = self.wait_margin
+                if delay_start is None:
+                    delay_start = now
+                    self._metrics["rate_limit_delays"] += 1
 
-                try:
-                    await asyncio.sleep(wait_time)
-                except asyncio.CancelledError:
-                    logger.warning(
-                        f"[{self.name}] Request cancelled while waiting for rate limit"
-                    )
-                    self.semaphore.release()
-                    self._metrics["current_requests"] = max(
-                        0, self._metrics["current_requests"] - 1
-                    )
-                    raise
-        except Exception as e:
-            # If something goes wrong, make sure we release the semaphore
-            self._metrics["errors"] += 1
-            logger.error(f"[{self.name}] Error in rate limiter: {str(e)}")
-            self.semaphore.release()
-            self._metrics["current_requests"] = max(
-                0, self._metrics["current_requests"] - 1
-            )
-            raise RuntimeError(f"Rate limiter error: {str(e)}") from e
+                # Sleep until the oldest request leaves the window, plus the margin
+                wait_time = (
+                    self.request_times[0] + self.time_period - now + self.wait_margin
+                )
+                logger.info(
+                    f"[{self.name}] Rate limit reached ({current_count}/{self._effective_max_requests}), "
+                    f"waiting {wait_time:.2f}s for a slot to open"
+                )
+                await asyncio.sleep(wait_time)
+        except BaseException:
+            # Cancelled while waiting: give the concurrency slot back
+            self.release()
+            raise
 
-    def release(self):
+    def release(self) -> None:
         """Release the semaphore to allow another concurrent request."""
         try:
             if self._semaphore is None:
                 raise ValueError("release() called before any acquire()")
-            self.semaphore.release()
+            self._semaphore.release()
             self._metrics["current_requests"] = max(
                 0, self._metrics["current_requests"] - 1
             )
@@ -276,12 +219,12 @@ class DualRateLimiter:
                 f"[{self.name}] Attempted to release rate limiter that wasn't acquired"
             )
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "DualRateLimiter":
         """Context manager entry - acquires permission to make a request."""
         await self.acquire()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Context manager exit - releases the semaphore."""
         self.release()
 
@@ -321,13 +264,8 @@ class DualRateLimiter:
             "time_period": self.time_period,
         }
 
-    def reset_metrics(self):
+    def reset_metrics(self) -> None:
         """Reset all metrics counters except for current state values."""
-        current_requests = self._metrics["current_requests"]
-        self._metrics = {
-            "total_requests": 0,
-            "current_requests": current_requests,  # Preserve this value
-            "rate_limit_delays": 0,
-            "total_delay_time": 0.0,
-            "errors": 0,
-        }
+        self._metrics.update(
+            total_requests=0, rate_limit_delays=0, total_delay_time=0.0, errors=0
+        )

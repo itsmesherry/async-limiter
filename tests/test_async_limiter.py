@@ -1,28 +1,10 @@
 import asyncio
-import logging
+import threading
 import time
 
 import pytest
 
-# Import the rate limiter
-from async_limiter.async_limiter import DualRateLimiter
-
-# Set up logging for tests
-logging.basicConfig(level=logging.INFO)
-
-
-# Helper for running timed tests
-async def timed_execution(coro):
-    """Run a coroutine and time its execution."""
-    start = time.time()
-    result = await coro
-    duration = time.time() - start
-    return result, duration
-
-
-#########################
-# Basic Initialization Tests
-#########################
+from async_limiter import DualRateLimiter
 
 
 def test_initialization():
@@ -60,12 +42,6 @@ def test_invalid_initialization():
         DualRateLimiter(max_concurrent=5, max_requests=10, time_period=0)
 
 
-#########################
-# Concurrent Limit Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_concurrent_limit():
     """Test that the rate limiter enforces the concurrent limit."""
     max_concurrent = 3
@@ -102,12 +78,6 @@ async def test_concurrent_limit():
     assert acquired == 0
 
 
-#########################
-# Rate Limit Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_rate_limit():
     """Test that the rate limiter enforces the request rate limit."""
     # Create a rate limiter with tight limits for testing
@@ -126,23 +96,15 @@ async def test_rate_limit():
         limiter.release()
 
     # The next request should be rate limited, timing roughly time_period
-    async def timed_request():
-        await limiter.acquire()
-        limiter.release()
-
-    # Time the execution of a rate-limited request
-    _, duration = await timed_execution(timed_request())
+    start = time.monotonic()
+    await limiter.acquire()
+    limiter.release()
+    duration = time.monotonic() - start
 
     # Should be close to time_period (allowing some margin for execution overhead)
     assert 0.9 * time_period <= duration <= 1.3 * time_period
 
 
-#########################
-# Context Manager Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_context_manager():
     """Test the limiter's context manager functionality."""
     limiter = DualRateLimiter(max_concurrent=5, max_requests=10, time_period=1)
@@ -156,12 +118,6 @@ async def test_context_manager():
     assert limiter._metrics["current_requests"] == 0
 
 
-#########################
-# Decorator Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_decorator():
     """Test the limiter's decorator functionality."""
     limiter = DualRateLimiter(max_concurrent=5, max_requests=10, time_period=1)
@@ -187,12 +143,6 @@ async def test_decorator():
     )  # Should be released after execution
 
 
-#########################
-# Exception Handling Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_exception_propagation():
     """Test that exceptions in the rate-limited code are properly propagated."""
     limiter = DualRateLimiter(max_concurrent=5, max_requests=10, time_period=1)
@@ -210,7 +160,6 @@ async def test_exception_propagation():
     assert limiter._metrics["current_requests"] == 0
 
 
-@pytest.mark.asyncio
 async def test_cancellation():
     """Test proper handling of task cancellation."""
     limiter = DualRateLimiter(max_concurrent=1, max_requests=1, time_period=5)
@@ -242,12 +191,6 @@ async def test_cancellation():
     assert limiter._metrics["current_requests"] == 0
 
 
-#########################
-# Metrics Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_metrics():
     """Test that metrics are properly tracked."""
     limiter = DualRateLimiter(max_concurrent=5, max_requests=5, time_period=1)
@@ -269,7 +212,6 @@ async def test_metrics():
     assert metrics["total_requests"] == 0
 
 
-@pytest.mark.asyncio
 async def test_delay_metrics():
     """Test that delay metrics are properly tracked."""
     # Create a rate limiter with tight limits to trigger delays
@@ -291,12 +233,6 @@ async def test_delay_metrics():
     assert metrics["total_delay_time"] > 0
 
 
-#########################
-# Multiple Limiter Tests
-#########################
-
-
-@pytest.mark.asyncio
 async def test_multiple_limiters():
     """Test that multiple rate limiters can be used independently."""
     limiter1 = DualRateLimiter(
@@ -343,7 +279,6 @@ async def _peak_in_flight(limiter, jobs=8, hold=0.02):
     return peak
 
 
-@pytest.mark.asyncio
 async def test_extra_release_does_not_raise_the_concurrent_limit():
     """Releasing more often than acquiring is ignored, not added as capacity."""
     limiter = DualRateLimiter(
@@ -356,7 +291,6 @@ async def test_extra_release_does_not_raise_the_concurrent_limit():
     assert await _peak_in_flight(limiter) == 2
 
 
-@pytest.mark.asyncio
 async def test_system_clock_change_does_not_stall_the_limiter(monkeypatch):
     """Setting the wall clock back must not keep requests waiting."""
     limiter = DualRateLimiter(
@@ -402,7 +336,6 @@ def test_time_limit_spans_event_loops():
     assert time.monotonic() - start >= 0.4
 
 
-@pytest.mark.asyncio
 async def test_wait_margin_zero_uses_the_full_limit():
     """Without a margin, waiting callers start as soon as the window allows."""
     limiter = DualRateLimiter(
@@ -435,3 +368,56 @@ def test_wait_margin_default_and_validation():
 
     with pytest.raises(ValueError, match="wait_margin"):
         DualRateLimiter(1, 1, 1, wait_margin=-0.1)
+
+
+async def test_cancelled_while_waiting_for_the_window_returns_the_slot():
+    """A caller that times out while sleeping on the time limit frees its slot."""
+    limiter = DualRateLimiter(
+        max_concurrent=1, max_requests=1, time_period=5, conservative=False
+    )
+    async with limiter:
+        pass
+
+    # The slot is free but the window is full, so this caller sleeps
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.2)
+
+    assert not limiter.semaphore.locked()
+    assert limiter.get_metrics()["current_requests"] == 0
+
+
+async def test_callers_queue_for_slots_behind_callers_waiting_for_the_window():
+    """Both limits hold when slot holders sleep on the window and others wait for a slot."""
+    limiter = DualRateLimiter(max_concurrent=2, max_requests=4, time_period=0.3)
+
+    assert await _peak_in_flight(limiter, jobs=8, hold=0.01) <= 2
+
+    metrics = limiter.get_metrics()
+    assert metrics["total_requests"] == 8
+    assert metrics["rate_limit_delays"] > 0
+    assert metrics["current_requests"] == 0
+
+
+def test_second_running_event_loop_is_rejected():
+    """Two threads cannot share a limiter: the second loop gets a clear error."""
+    limiter = DualRateLimiter(max_concurrent=1, max_requests=10, time_period=1)
+    holding = threading.Event()
+    done = threading.Event()
+
+    async def hold_a_slot():
+        async with limiter:
+            holding.set()
+            while not done.is_set():
+                await asyncio.sleep(0.01)
+
+    thread = threading.Thread(target=asyncio.run, args=(hold_a_slot(),))
+    thread.start()
+    try:
+        assert holding.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="another running event loop"):
+            asyncio.run(limiter.acquire())
+    finally:
+        done.set()
+        thread.join(timeout=5)
+
+    assert limiter.get_metrics()["current_requests"] == 0
