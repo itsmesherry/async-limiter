@@ -74,14 +74,16 @@ class DualRateLimiter:
             max_requests if not conservative else max(1, max_requests - 1)
         )
 
-        # Semaphore to limit concurrent requests
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        # Semaphore to limit concurrent requests and lock to protect the
+        # request_times queue. Both are created on first use, inside the running
+        # event loop: on Python 3.9 they cannot be created without one
+        self._semaphore: Optional[asyncio.BoundedSemaphore] = None
+        self._lock: Optional[asyncio.Lock] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Queue to track request timestamps
+        # Queue to track request timestamps (time.monotonic(), so that changes
+        # to the system clock cannot stall or loosen the limit)
         self.request_times: Deque[float] = deque()
-
-        # Lock to protect the request_times queue during concurrent access
-        self.lock = asyncio.Lock()
 
         # Metrics
         self._metrics = {
@@ -98,9 +100,47 @@ class DualRateLimiter:
             f"(conservative from original {max_requests})"
         )
 
+    @property
+    def semaphore(self) -> asyncio.BoundedSemaphore:
+        """Semaphore limiting concurrent requests. Bounded, so that releasing
+        more often than acquiring cannot raise the limit."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
+        return self._semaphore
+
+    @semaphore.setter
+    def semaphore(self, value: asyncio.BoundedSemaphore) -> None:
+        self._semaphore = value
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Lock protecting the request_times queue."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    @lock.setter
+    def lock(self, value: asyncio.Lock) -> None:
+        self._lock = value
+
+    def _bind_to_running_loop(self) -> None:
+        """
+        Start with a fresh semaphore and lock when the event loop has changed.
+
+        asyncio primitives belong to the loop they first waited in, so a limiter
+        created at module level and used from a second asyncio.run() would fail.
+        The request history is kept: the time-based limit spans event loops.
+        """
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            self._loop = loop
+            self.semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
+            self.lock = asyncio.Lock()
+            self._metrics["current_requests"] = 0
+
     async def _clean_old_requests(self):
         """Remove request timestamps that are outside the time period."""
-        current_time = time.time()
+        current_time = time.monotonic()
         cutoff_time = current_time - self.time_period
 
         old_count = len(self.request_times)
@@ -122,6 +162,8 @@ class DualRateLimiter:
             asyncio.CancelledError: If the task is cancelled while waiting
             RuntimeError: If other unexpected errors occur during acquisition
         """
+        self._bind_to_running_loop()
+
         # First, acquire the semaphore to ensure we don't exceed concurrent limits
         try:
             await self.semaphore.acquire()
@@ -149,12 +191,12 @@ class DualRateLimiter:
                     # If we have room for another request within the time period
                     if current_count < self._effective_max_requests:
                         # Record this request's timestamp
-                        self.request_times.append(time.time())
+                        self.request_times.append(time.monotonic())
                         self._metrics["total_requests"] += 1
 
                         # Record delay metrics if there was a delay
                         if delay_start is not None:
-                            delay_time = time.time() - delay_start
+                            delay_time = time.monotonic() - delay_start
                             self._metrics["total_delay_time"] += delay_time
                             logger.debug(
                                 f"[{self.name}] Request allowed after waiting {delay_time:.2f}s"
@@ -164,11 +206,11 @@ class DualRateLimiter:
                     else:
                         # Calculate wait time until the oldest request expires
                         oldest_time = self.request_times[0]
-                        wait_time = oldest_time + self.time_period - time.time()
+                        wait_time = oldest_time + self.time_period - time.monotonic()
 
                         # Record that we hit the rate limit
                         if delay_start is None:
-                            delay_start = time.time()
+                            delay_start = time.monotonic()
                             self._metrics["rate_limit_delays"] += 1
 
                         logger.info(
@@ -182,7 +224,7 @@ class DualRateLimiter:
                         oldest_request = self.request_times[0]
                         # Add a small buffer (0.1 second) to be safe
                         wait_time = max(
-                            0.1, oldest_request + self.time_period - time.time() + 0.1
+                            0.1, oldest_request + self.time_period - time.monotonic() + 0.1
                         )
                     else:
                         wait_time = 0.1
@@ -211,6 +253,8 @@ class DualRateLimiter:
     def release(self):
         """Release the semaphore to allow another concurrent request."""
         try:
+            if self._semaphore is None:
+                raise ValueError("release() called before any acquire()")
             self.semaphore.release()
             self._metrics["current_requests"] = max(
                 0, self._metrics["current_requests"] - 1
