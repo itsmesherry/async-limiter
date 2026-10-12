@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "async-limiter"
-version = "1.1.0"
+version = "1.2.0"
 description = "An asyncio rate limiter that enforces a concurrency limit and a requests-per-period limit together"
 readme = "README.md"
 authors = [
