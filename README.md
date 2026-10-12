@@ -49,10 +49,12 @@ asyncio.run(main())
 async with limiter:
     await call_api()
 
+
 # As a decorator
 @limiter.limit()
 async def call_api_limited():
     return await call_api()
+
 
 # With explicit acquire and release
 await limiter.acquire()
@@ -105,7 +107,7 @@ limiter = DualRateLimiter(
     max_requests=100,
     time_period=60,
     conservative=False,  # allow 100 per window, not 99
-    wait_margin=0,       # start as soon as a slot opens
+    wait_margin=0,  # start as soon as a slot opens
 )
 ```
 
@@ -120,12 +122,12 @@ limiter.get_metrics()
 
 ```python
 {
-    "total_requests": 100,          # requests let through
-    "current_requests": 2,          # holding a concurrency slot right now
-    "rate_limit_delays": 5,         # requests that had to wait for the window
-    "total_delay_time": 12.5,       # seconds spent in those waits
+    "total_requests": 100,  # requests let through
+    "current_requests": 2,  # holding a concurrency slot right now
+    "rate_limit_delays": 5,  # requests that had to wait for the window
+    "total_delay_time": 12.5,  # seconds spent in those waits
     "errors": 0,
-    "current_queue_size": 3,        # requests started within the current window
+    "current_queue_size": 3,  # requests started within the current window
     "max_concurrent": 5,
     "max_requests_per_period": 99,  # after the conservative adjustment
     "time_period": 60,
@@ -148,7 +150,8 @@ logging.getLogger("rate_limiter").setLevel(logging.WARNING)  # quiet it down
 ## Example
 
 [`examples/api_client.py`](https://github.com/itsmesherry/async-limiter/blob/main/examples/api_client.py)
-wraps an `aiohttp` client with a limiter and prints its metrics.
+fetches 40 resources from a public test API through one shared limiter and
+prints its metrics. It needs `aiohttp`.
 
 ## Project
 

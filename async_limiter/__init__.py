@@ -1,7 +1,7 @@
 """
 Async Dual Rate Limiter
 
-A production-ready asyncio-based rate limiter for Python that enforces
+An asyncio-based rate limiter for Python that enforces
 both concurrent and time-based rate limits.
 """
 

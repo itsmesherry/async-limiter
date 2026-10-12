@@ -14,7 +14,7 @@ pip install -e ".[dev]"
 ## Before opening a pull request
 
 ```bash
-make qa   # ruff format, ruff check, mypy, pytest
+ruff format && ruff check . && mypy async_limiter && pytest
 ```
 
 CI runs the same checks on Python 3.9 to 3.13, so avoid syntax newer than 3.9

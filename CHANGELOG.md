@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An unexpected error inside `acquire()` is no longer re-raised as
+  `RuntimeError`; the original exception propagates. No such error is known to
+  occur, and the `errors` metric stays in `get_metrics()` with a value of 0.
+- The `test` extra no longer installs `aiohttp`, which only the example uses.
+- The package is classified as Beta, not Production/Stable.
 - `request_times` holds `time.monotonic()` values, not `time.time()` values.
 
 ## [1.1.0] - 2025-03-27
