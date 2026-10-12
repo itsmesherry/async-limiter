@@ -400,3 +400,38 @@ def test_time_limit_spans_event_loops():
     asyncio.run(two_requests())
 
     assert time.monotonic() - start >= 0.4
+
+
+@pytest.mark.asyncio
+async def test_wait_margin_zero_uses_the_full_limit():
+    """Without a margin, waiting callers start as soon as the window allows."""
+    limiter = DualRateLimiter(
+        max_concurrent=10,
+        max_requests=5,
+        time_period=0.3,
+        conservative=False,
+        wait_margin=0,
+    )
+    starts = []
+
+    async def job():
+        async with limiter:
+            starts.append(time.monotonic())
+
+    began = time.monotonic()
+    await asyncio.gather(*[job() for _ in range(15)])
+    duration = time.monotonic() - began
+
+    # 15 requests at 5 per 0.3s need two full windows; the default margin adds 0.2s
+    assert 0.6 <= duration < 0.78
+    # The limit still holds: never more than 5 starts within any 0.3s
+    starts.sort()
+    assert all(later - earlier >= 0.3 for earlier, later in zip(starts, starts[5:]))
+
+
+def test_wait_margin_default_and_validation():
+    """The margin defaults to 0.1 seconds and cannot be negative."""
+    assert DualRateLimiter(1, 1, 1).wait_margin == 0.1
+
+    with pytest.raises(ValueError, match="wait_margin"):
+        DualRateLimiter(1, 1, 1, wait_margin=-0.1)
