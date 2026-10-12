@@ -325,3 +325,78 @@ async def test_multiple_limiters():
 
 if __name__ == "__main__":
     pytest.main(["-vs", __file__])
+
+
+async def _peak_in_flight(limiter, jobs=8, hold=0.02):
+    """Run jobs through the limiter and return the most that ran at once."""
+    in_flight = peak = 0
+
+    async def job():
+        nonlocal in_flight, peak
+        async with limiter:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(hold)
+            in_flight -= 1
+
+    await asyncio.gather(*[job() for _ in range(jobs)])
+    return peak
+
+
+@pytest.mark.asyncio
+async def test_extra_release_does_not_raise_the_concurrent_limit():
+    """Releasing more often than acquiring is ignored, not added as capacity."""
+    limiter = DualRateLimiter(
+        max_concurrent=2, max_requests=1000, time_period=1, conservative=False
+    )
+
+    limiter.release()
+    limiter.release()
+
+    assert await _peak_in_flight(limiter) == 2
+
+
+@pytest.mark.asyncio
+async def test_system_clock_change_does_not_stall_the_limiter(monkeypatch):
+    """Setting the wall clock back must not keep requests waiting."""
+    limiter = DualRateLimiter(
+        max_concurrent=5, max_requests=1, time_period=0.2, conservative=False
+    )
+    async with limiter:
+        pass
+
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() - 3600)
+
+    await asyncio.wait_for(limiter.acquire(), timeout=2)
+    limiter.release()
+
+
+def test_limiter_works_across_event_loops():
+    """A limiter created outside any loop can be used by several asyncio.run() calls."""
+    limiter = DualRateLimiter(
+        max_concurrent=1, max_requests=1000, time_period=1, conservative=False
+    )
+
+    for _ in range(2):
+        assert asyncio.run(_peak_in_flight(limiter, jobs=3, hold=0.01)) == 1
+
+    assert limiter.get_metrics()["total_requests"] == 6
+
+
+def test_time_limit_spans_event_loops():
+    """Requests made in one event loop still count against the limit in the next."""
+    limiter = DualRateLimiter(
+        max_concurrent=5, max_requests=2, time_period=0.5, conservative=False
+    )
+
+    async def two_requests():
+        for _ in range(2):
+            async with limiter:
+                pass
+
+    asyncio.run(two_requests())
+    start = time.monotonic()
+    asyncio.run(two_requests())
+
+    assert time.monotonic() - start >= 0.4
