@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -367,3 +368,56 @@ def test_wait_margin_default_and_validation():
 
     with pytest.raises(ValueError, match="wait_margin"):
         DualRateLimiter(1, 1, 1, wait_margin=-0.1)
+
+
+async def test_cancelled_while_waiting_for_the_window_returns_the_slot():
+    """A caller that times out while sleeping on the time limit frees its slot."""
+    limiter = DualRateLimiter(
+        max_concurrent=1, max_requests=1, time_period=5, conservative=False
+    )
+    async with limiter:
+        pass
+
+    # The slot is free but the window is full, so this caller sleeps
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.2)
+
+    assert not limiter.semaphore.locked()
+    assert limiter.get_metrics()["current_requests"] == 0
+
+
+async def test_callers_queue_for_slots_behind_callers_waiting_for_the_window():
+    """Both limits hold when slot holders sleep on the window and others wait for a slot."""
+    limiter = DualRateLimiter(max_concurrent=2, max_requests=4, time_period=0.3)
+
+    assert await _peak_in_flight(limiter, jobs=8, hold=0.01) <= 2
+
+    metrics = limiter.get_metrics()
+    assert metrics["total_requests"] == 8
+    assert metrics["rate_limit_delays"] > 0
+    assert metrics["current_requests"] == 0
+
+
+def test_second_running_event_loop_is_rejected():
+    """Two threads cannot share a limiter: the second loop gets a clear error."""
+    limiter = DualRateLimiter(max_concurrent=1, max_requests=10, time_period=1)
+    holding = threading.Event()
+    done = threading.Event()
+
+    async def hold_a_slot():
+        async with limiter:
+            holding.set()
+            while not done.is_set():
+                await asyncio.sleep(0.01)
+
+    thread = threading.Thread(target=asyncio.run, args=(hold_a_slot(),))
+    thread.start()
+    try:
+        assert holding.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="another running event loop"):
+            asyncio.run(limiter.acquire())
+    finally:
+        done.set()
+        thread.join(timeout=5)
+
+    assert limiter.get_metrics()["current_requests"] == 0

@@ -133,17 +133,27 @@ class DualRateLimiter:
         asyncio primitives belong to the loop they first waited in, so a limiter
         created at module level and used from a second asyncio.run() would fail.
         The request history is kept: the time-based limit spans event loops.
+
+        Raises:
+            RuntimeError: If the previous loop is still running, which means two
+                threads are using the limiter at the same time
         """
         loop = asyncio.get_running_loop()
         if loop is not self._loop:
+            if self._loop is not None and self._loop.is_running():
+                raise RuntimeError(
+                    f"DualRateLimiter '{self.name}' is in use by another running "
+                    "event loop; it cannot be shared between event loops that "
+                    "run at the same time"
+                )
             self._loop = loop
             self._semaphore = asyncio.BoundedSemaphore(self.max_concurrent)
             self._lock = None
             self._metrics["current_requests"] = 0
 
-    def _clean_old_requests(self) -> None:
+    def _clean_old_requests(self, now: float) -> None:
         """Remove request timestamps that are outside the time period."""
-        cutoff_time = time.monotonic() - self.time_period
+        cutoff_time = now - self.time_period
         while self.request_times and self.request_times[0] <= cutoff_time:
             self.request_times.popleft()
 
@@ -161,8 +171,8 @@ class DualRateLimiter:
         try:
             delay_start = None
             while True:
-                self._clean_old_requests()
                 now = time.monotonic()
+                self._clean_old_requests(now)
                 current_count = len(self.request_times)
 
                 if current_count < self._effective_max_requests:

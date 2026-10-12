@@ -94,8 +94,9 @@ the same API. Use one limiter per API.
 - **Cancellation is safe.** A caller cancelled while waiting, for example by
   `asyncio.wait_for`, gives its slot back.
 - **One process, one event loop at a time.** The limiter is not shared between
-  processes or threads. It can be reused by successive `asyncio.run()` calls,
-  and the request history carries over between them.
+  processes or threads; `acquire()` raises `RuntimeError` if another event loop
+  is running with it. It can be reused by successive `asyncio.run()` calls, and
+  the request history carries over between them.
 
 ## Using the full limit
 

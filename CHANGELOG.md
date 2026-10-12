@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An unexpected error inside `acquire()` is no longer re-raised as
   `RuntimeError`; the original exception propagates. No such error is known to
   occur, and the `errors` metric stays in `get_metrics()` with a value of 0.
+- The limiter no longer logs a warning when a waiting caller is cancelled, or a
+  debug line each time old requests leave the window.
+- Using one limiter from two event loops that run at the same time (two
+  threads) raises `RuntimeError` on `acquire()`.
 - The `test` extra no longer installs `aiohttp`, which only the example uses.
 - The package is classified as Beta, not Production/Stable.
 - `request_times` holds `time.monotonic()` values, not `time.time()` values.
