@@ -3,9 +3,9 @@
 Planned work, roughly in priority order. Open an issue or pull request if you
 want to pick one up.
 
-- [ ] Make the 0.1 second wait margin configurable; on short windows it keeps
-      throughput well below the limit (30 requests at 10 per 0.5 s take 1.2 s
-      where 1.0 s is possible)
+- [ ] In the next major version, consider turning both safety margins off by
+      default (`conservative=False`, `wait_margin=0`), so that the limiter
+      enforces exactly the numbers it is given
 - [ ] Decide whether callers waiting on the time limit should hold a
       concurrency slot
 - [ ] Serve waiting callers in arrival order

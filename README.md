@@ -74,6 +74,7 @@ the same API. Use one limiter per API.
 | `time_period`    |         | Length of the window, in seconds                           |
 | `conservative`   | True    | Allow one request fewer than `max_requests` per window     |
 | `name`           | None    | Label used in log messages                                 |
+| `wait_margin`    | 0.1     | Extra seconds to sleep past the moment a slot opens        |
 
 ## How the limits behave
 
@@ -84,8 +85,8 @@ the same API. Use one limiter per API.
   99 through per window, to leave a margin for clock differences with the
   server. Pass `conservative=False` to use the full limit.
 - **Waiting adds a small margin.** A caller that has to wait for the window
-  sleeps 0.1 seconds past the moment a slot opens. On windows of a second or
-  less this lowers throughput noticeably.
+  sleeps `wait_margin` seconds (0.1 by default) past the moment a slot opens.
+  On windows of a second or less this lowers throughput noticeably.
 - **A waiting caller holds a concurrency slot.** The concurrency limit is taken
   first, so callers queued on the time limit count as in flight.
 - **Cancellation is safe.** A caller cancelled while waiting, for example by
@@ -93,6 +94,23 @@ the same API. Use one limiter per API.
 - **One process, one event loop at a time.** The limiter is not shared between
   processes or threads. It can be reused by successive `asyncio.run()` calls,
   and the request history carries over between them.
+
+## Using the full limit
+
+Both safety margins are on by default. To get exactly the numbers you pass in:
+
+```python
+limiter = DualRateLimiter(
+    max_concurrent=5,
+    max_requests=100,
+    time_period=60,
+    conservative=False,  # allow 100 per window, not 99
+    wait_margin=0,       # start as soon as a slot opens
+)
+```
+
+Keep the margins when the limit is enforced by a server whose clock and
+counting you cannot see; drop them when you control both sides.
 
 ## Metrics
 

@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wait_margin` argument: the extra time a waiting caller sleeps past the moment
+  a slot opens. It defaults to 0.1 seconds, the value that was hardcoded before;
+  `wait_margin=0` gives the full allowed throughput.
 - `py.typed` marker, so type checkers use the package's annotations.
 - Python 3.12 and 3.13 are tested and declared as supported.
 - `dev` extra with the tools CI runs.

@@ -45,6 +45,7 @@ class DualRateLimiter:
         time_period: float,
         conservative: bool = True,
         name: Optional[str] = None,
+        wait_margin: float = 0.1,
     ):
         """
         Initialize the rate limiter.
@@ -55,6 +56,9 @@ class DualRateLimiter:
             time_period: Time period in seconds for the request limit
             conservative: If True, use a more conservative limit to avoid edge cases
             name: Optional name for this rate limiter instance (useful for logging)
+            wait_margin: Extra seconds a caller sleeps past the moment a slot in the
+                time window opens. A safety margin against clock differences with
+                the server; 0 gives the full allowed throughput
         """
         if max_concurrent <= 0:
             raise ValueError("max_concurrent must be greater than 0")
@@ -62,11 +66,14 @@ class DualRateLimiter:
             raise ValueError("max_requests must be greater than 0")
         if time_period <= 0:
             raise ValueError("time_period must be greater than 0")
+        if wait_margin < 0:
+            raise ValueError("wait_margin must not be negative")
 
         self.max_concurrent = max_concurrent
         self.max_requests = max_requests
         self.time_period = time_period
         self.name = name or "default"
+        self.wait_margin = wait_margin
 
         # Make the rate limit more conservative to avoid edge cases
         # For example, if API allows 5 requests per minute, we'll allow 4
@@ -144,7 +151,7 @@ class DualRateLimiter:
         cutoff_time = current_time - self.time_period
 
         old_count = len(self.request_times)
-        while self.request_times and self.request_times[0] < cutoff_time:
+        while self.request_times and self.request_times[0] <= cutoff_time:
             self.request_times.popleft()
         new_count = len(self.request_times)
 
@@ -222,12 +229,16 @@ class DualRateLimiter:
                 async with self.lock:
                     if self.request_times:
                         oldest_request = self.request_times[0]
-                        # Add a small buffer (0.1 second) to be safe
+                        # Add a small buffer (wait_margin) to be safe
                         wait_time = max(
-                            0.1, oldest_request + self.time_period - time.monotonic() + 0.1
+                            self.wait_margin,
+                            oldest_request
+                            + self.time_period
+                            - time.monotonic()
+                            + self.wait_margin,
                         )
                     else:
-                        wait_time = 0.1
+                        wait_time = self.wait_margin
 
                 try:
                     await asyncio.sleep(wait_time)
