@@ -1,194 +1,137 @@
-# Async Dual Rate Limiter
+<h1 align="center">async-limiter</h1>
 
-[![PyPI](https://img.shields.io/pypi/v/async-limiter)](https://pypi.org/project/async-limiter/)
-[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11-blue)](https://pypi.org/project/async-limiter/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/Shehryar718/async-limiter/blob/main/LICENSE)
+<p align="center">
+  An asyncio rate limiter that enforces two limits at once:<br>
+  how many requests run at the same time, and how many start per time period.
+</p>
 
-A production-ready asyncio-based rate limiter for Python that enforces both concurrent and time-based rate limits.
+<p align="center">
+  <a href="https://pypi.org/project/async-limiter/"><img alt="PyPI" src="https://img.shields.io/pypi/v/async-limiter"></a>
+  <a href="https://github.com/itsmesherry/async-limiter/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/itsmesherry/async-limiter/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://pypi.org/project/async-limiter/"><img alt="Python" src="https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue"></a>
+  <a href="https://pypi.org/project/async-limiter/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/async-limiter"></a>
+  <a href="https://github.com/itsmesherry/async-limiter/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
 
-## Features
-
-- Enforce maximum concurrent requests
-- Enforce maximum requests per time period
-- Works as a context manager, decorator, or with explicit acquire/release
-- Comprehensive metrics collection
-- Production-ready error handling
-- Task cancellation support
-
-## Installation
+Many APIs publish both kinds of limit, for example "at most 5 requests in
+flight and at most 100 per minute". `DualRateLimiter` holds a caller back until
+both allow it. It has no dependencies.
 
 ```bash
-# Install from PyPI
 pip install async-limiter
 ```
 
-Or install from source:
-
-```bash
-# Clone the repository
-git clone https://github.com/Shehryar718/async-limiter.git
-cd async-limiter
-
-# Install in development mode
-pip install -e .
-
-# Install with test dependencies
-pip install -e ".[test]"
-```
-
-## Usage
-
-### Basic Usage
-
 ```python
 import asyncio
 from async_limiter import DualRateLimiter
 
-# Create a rate limiter with max 5 concurrent requests and max 100 requests per minute
 limiter = DualRateLimiter(max_concurrent=5, max_requests=100, time_period=60)
 
-# Use as a context manager
-async def fetch_data():
-    async with limiter:
-        # Your API call here
-        return await api_call()
 
-# Or use acquire/release manually
-async def fetch_data_manual():
-    await limiter.acquire()
-    try:
-        # Your API call here
-        return await api_call()
-    finally:
-        limiter.release()
+async def fetch(i):
+    async with limiter:  # waits here until both limits allow the call
+        await asyncio.sleep(0.1)  # your API call
+        return i
 
-# Or use as a decorator
-@limiter.limit()
-async def fetch_data_decorated():
-    # Your API call here
-    return await api_call()
+
+async def main():
+    results = await asyncio.gather(*[fetch(i) for i in range(20)])
+    print(results)
+
+
+asyncio.run(main())
 ```
 
-### With API Client Example
+## Three ways to use it
 
 ```python
-import asyncio
-from aiohttp import ClientSession
-from async_limiter import DualRateLimiter
+# As a context manager
+async with limiter:
+    await call_api()
 
-class ApiClient:
-    def __init__(self, base_url="https://api.example.com"):
-        self.base_url = base_url
-        
-        # Create a rate limiter for this API
-        self.rate_limiter = DualRateLimiter(
-            max_concurrent=5,
-            max_requests=10,
-            time_period=60,
-            name="example_api"
-        )
-        
-    async def get_data(self, path, params=None):
-        """Make a rate-limited GET request."""
-        url = f"{self.base_url}/{path}"
-        
-        # Use the rate limiter as a context manager
-        async with self.rate_limiter:
-            async with ClientSession() as session:
-                response = await session.get(url, params=params)
-                data = await response.json()
-                return data
-                
-    @property
-    def metrics(self):
-        """Get rate limiter metrics."""
-        return self.rate_limiter.get_metrics()
+# As a decorator
+@limiter.limit()
+async def call_api_limited():
+    return await call_api()
 
-# Usage
-async def main():
-    api = ApiClient()
-    
-    # Make multiple concurrent requests (will be automatically rate limited)
-    tasks = [api.get_data(f"resource/{i}") for i in range(20)]
-    results = await asyncio.gather(*tasks)
-    
-    # Check metrics
-    print(api.metrics)
-    
-if __name__ == "__main__":
-    asyncio.run(main())
+# With explicit acquire and release
+await limiter.acquire()
+try:
+    await call_api()
+finally:
+    limiter.release()
 ```
+
+A limiter can be created at module level and shared by every task that calls
+the same API. Use one limiter per API.
+
+## Options
+
+| Argument         | Default | Meaning                                                    |
+| ---------------- | ------- | ---------------------------------------------------------- |
+| `max_concurrent` |         | Most requests allowed in flight at once                    |
+| `max_requests`   |         | Most requests allowed to start within `time_period`        |
+| `time_period`    |         | Length of the window, in seconds                           |
+| `conservative`   | True    | Allow one request fewer than `max_requests` per window     |
+| `name`           | None    | Label used in log messages                                 |
+
+## How the limits behave
+
+- **The window slides.** A request may start when fewer than `max_requests`
+  have started in the last `time_period` seconds, counted from each request's
+  start.
+- **`conservative` is on by default.** With `max_requests=100` the limiter lets
+  99 through per window, to leave a margin for clock differences with the
+  server. Pass `conservative=False` to use the full limit.
+- **Waiting adds a small margin.** A caller that has to wait for the window
+  sleeps 0.1 seconds past the moment a slot opens. On windows of a second or
+  less this lowers throughput noticeably.
+- **A waiting caller holds a concurrency slot.** The concurrency limit is taken
+  first, so callers queued on the time limit count as in flight.
+- **Cancellation is safe.** A caller cancelled while waiting, for example by
+  `asyncio.wait_for`, gives its slot back.
+- **One process, one event loop at a time.** The limiter is not shared between
+  processes or threads. It can be reused by successive `asyncio.run()` calls,
+  and the request history carries over between them.
 
 ## Metrics
 
-Get detailed metrics from the rate limiter:
-
 ```python
-metrics = limiter.get_metrics()
-print(metrics)
+limiter.get_metrics()
 ```
-
-Example output:
 
 ```python
 {
-    "total_requests": 100,
-    "current_requests": 2,
-    "rate_limit_delays": 5,
-    "total_delay_time": 12.5,
+    "total_requests": 100,          # requests let through
+    "current_requests": 2,          # holding a concurrency slot right now
+    "rate_limit_delays": 5,         # requests that had to wait for the window
+    "total_delay_time": 12.5,       # seconds spent in those waits
     "errors": 0,
-    "current_queue_size": 3,
+    "current_queue_size": 3,        # requests started within the current window
     "max_concurrent": 5,
-    "max_requests_per_period": 9,
-    "time_period": 60
+    "max_requests_per_period": 99,  # after the conservative adjustment
+    "time_period": 60,
 }
 ```
 
-## Running Tests
+`limiter.reset_metrics()` zeroes the counters.
 
-The package includes comprehensive tests. To run them:
+## Logging
 
-```bash
-# Install test dependencies
-pip install -e ".[test]"
+The limiter logs to the `rate_limiter` logger: a line at `INFO` when it is
+created and each time a caller has to wait, and details at `DEBUG`.
 
-# Run all tests
-pytest
+```python
+import logging
 
-# Run specific test file
-pytest tests/test_async_limiter.py
-
-# Run tests with detailed output
-pytest -v
-
-# Run tests with log output
-pytest -v --log-cli-level=INFO
-
-# Run tests with coverage report
-pytest --cov=async_limiter
+logging.getLogger("rate_limiter").setLevel(logging.WARNING)  # quiet it down
 ```
 
-## Development
+## Example
 
-This project uses modern Python packaging with `pyproject.toml`. The development tools configured include:
+[`examples/api_client.py`](https://github.com/itsmesherry/async-limiter/blob/main/examples/api_client.py)
+wraps an `aiohttp` client with a limiter and prints its metrics.
 
-- **pytest**: For running tests
-- **ruff**: For code formatting and linting
-- **mypy**: For type checking
-- **coverage**: For measuring test coverage
+## Project
 
-## Why Use Async Dual Rate Limiter?
-
-Many APIs impose both concurrent and time-based rate limits. This package provides a clean, 
-efficient solution to handle both types of limits with minimal overhead and maximum flexibility.
-
-Key advantages:
-- **Production Ready**: Thoroughly tested with extensive error handling
-- **Flexible API**: Use as a context manager, decorator, or with explicit calls
-- **Detailed Metrics**: Track usage and performance with built-in metrics
-- **Type Annotated**: Full type annotations make integration easier
-- **Pure Python**: No external dependencies required
-
-## License
-
-MIT License 
+[Changelog](https://github.com/itsmesherry/async-limiter/blob/main/CHANGELOG.md) · [Contributing](https://github.com/itsmesherry/async-limiter/blob/main/CONTRIBUTING.md) · [Roadmap](https://github.com/itsmesherry/async-limiter/blob/main/TODO.md) · [MIT License](https://github.com/itsmesherry/async-limiter/blob/main/LICENSE)
